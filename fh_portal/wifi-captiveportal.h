@@ -12,4 +12,7 @@ void start_captive_portal(HttpGetHandler *handler, const char *ssid);
 void start_web_server(HttpGetHandler *_handler);
 void stop_web_server(void);
 void stop_captive_portal(void);
+
+const char* get_portal_redirect_url(void);
+
 #endif

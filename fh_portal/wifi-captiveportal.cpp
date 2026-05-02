@@ -27,10 +27,15 @@ extern "C" esp_err_t dev_wifi_init(wifi_init_config_t *config);
 
 #include "wifi-captiveportal.h"
 
-#undef CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
 #define EXAMPLE_MAX_STA_CONN 4
 
 extern "C" const char *TAG;
+
+static char portal_redirect_url[40] = "http://192.168.4.1/";
+
+const char* get_portal_redirect_url(void) {
+    return portal_redirect_url;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -74,40 +79,39 @@ static void wifi_init_softap(const char *ssid)
     ESP_LOGI(TAG, "wifi_init_softap finished. SSID:'%s'", ssid);
 }
 
-#ifdef CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
+// Advertises the captive portal via DHCP Option 114 (RFC 8910).
+// Android 11+ and Samsung One UI read this before HTTP probing, so this is
+// the most reliable trigger on modern devices. Also populates portal_redirect_url
+// for use in HTTP redirect responses.
 static void dhcp_set_captiveportal_url(void) {
-    // get the IP of the access point to redirect to
     esp_netif_ip_info_t ip_info;
     esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip_info);
 
     char ip_addr[16];
-    inet_ntoa_r(ip_info.ip.addr, ip_addr, 16);
-    ESP_LOGI(TAG, "Set up softAP with IP: %s", ip_addr);
+    inet_ntoa_r(ip_info.ip.addr, ip_addr, sizeof(ip_addr));
 
-    // turn the IP into a URI
-    char* captiveportal_uri = (char*) malloc(32 * sizeof(char));
-    assert(captiveportal_uri && "Failed to allocate captiveportal_uri");
-    strcpy(captiveportal_uri, "http://");
-    strcat(captiveportal_uri, ip_addr);
+    // Store root URL used by all HTTP redirect handlers
+    snprintf(portal_redirect_url, sizeof(portal_redirect_url), "http://%s/", ip_addr);
 
-    // get a handle to configure DHCP with
+    // DHCP Option 114 points to the RFC 8908 JSON API endpoint (not the root page)
+    char api_uri[48];
+    snprintf(api_uri, sizeof(api_uri), "http://%s/api/captive", ip_addr);
+
+    ESP_LOGI(TAG, "Captive portal: redirect=%s api=%s", portal_redirect_url, api_uri);
+
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-
-    // set the DHCP option 114
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(netif));
-    ESP_ERROR_CHECK(esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI, captiveportal_uri, strlen(captiveportal_uri)));
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+                                           api_uri, strlen(api_uri)));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(netif));
 }
-#endif // CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
 
 // HTTP Error (404) Handler - Redirects all requests to the anyGet page
 esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 {
-    // Set status
-    httpd_resp_set_status(req, "302 Temporary Redirect");
-    // Redirect to the "/" anyGet directory
-    httpd_resp_set_hdr(req, "Location", "/");
-    // iOS requires content in the response to detect a captive portal, simply redirecting is not sufficient.
+    httpd_resp_set_status(req, "302 Found");
+    // Absolute URL required — Android/Samsung reject private-IP portals from relative redirects
+    httpd_resp_set_hdr(req, "Location", portal_redirect_url);
     httpd_resp_send(req, "Redirect to the captive portal", HTTPD_RESP_USE_STRLEN);
 
     ESP_LOGI(TAG, "Redirecting to /");
@@ -117,8 +121,55 @@ esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 static HttpGetHandler *handler;
 static httpd_handle_t server = NULL;
 static dns_server_handle_t dns_handle = NULL;
+static bool captive_mode = false;
 
 static esp_err_t getHandler(httpd_req_t *req) {
+    char host[64] = "";
+    httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    ESP_LOGI(TAG, "HTTP %s (host:%s)", req->uri, host);
+
+    if (!captive_mode) {
+        return handler->getHandler(req);
+    }
+
+    // RFC 8908 Captive Portal API — fetched by Android 11+ / Samsung One UI after reading DHCP Option 114
+    if (strncmp(req->uri, "/api/captive", 12) == 0) {
+        char json[96];
+        snprintf(json, sizeof(json),
+                 "{\"captive\":true,\"user-portal-url\":\"%s\"}", portal_redirect_url);
+        httpd_resp_set_type(req, "application/captive+json");
+        httpd_resp_set_hdr(req, "Cache-Control", "private");
+        httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    // OS captive-portal probe URLs — explicit 302 to absolute portal URL
+    if (strncmp(req->uri, "/generate_204",    13) == 0 ||
+        strncmp(req->uri, "/hotspot-detect",  15) == 0 ||
+        strncmp(req->uri, "/ncsi.txt",         9) == 0 ||
+        strncmp(req->uri, "/connecttest.txt", 16) == 0) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", portal_redirect_url);
+        httpd_resp_send(req, "", 0);
+        return ESP_OK;
+    }
+
+    // Any request whose Host header doesn't match our AP IP arrived via DNS spoofing
+    // (e.g. Samsung's http://www.samsung.com/ probe, or any other vendor-specific URL
+    // whose path happens to be "/"). Return a 302 so the OS recognises it as a captive
+    // portal redirect rather than treating the served page as a successful internet fetch.
+    if (host[0]) {
+        const char *ap_ip = portal_redirect_url + 7;  // skip "http://"
+        size_t ip_len = strlen(ap_ip) - 1;             // exclude trailing "/"
+        if (strncmp(host, ap_ip, ip_len) != 0) {
+            ESP_LOGI(TAG, "Redirect spoofed host '%s' -> portal", host);
+            httpd_resp_set_status(req, "302 Found");
+            httpd_resp_set_hdr(req, "Location", portal_redirect_url);
+            httpd_resp_send(req, "", 0);
+            return ESP_OK;
+        }
+    }
+
     return handler->getHandler(req);
 }
 
@@ -174,10 +225,10 @@ void start_captive_portal(HttpGetHandler *_handler, const char *ssid) {
   // Initialise ESP32 in SoftAP mode
   wifi_init_softap(ssid);
 
-// Configure DNS-based captive portal, if configured
-#ifdef CONFIG_ESP_ENABLE_DHCP_CAPTIVEPORTAL
+  captive_mode = true;
+
+  // DHCP Option 114 (RFC 8910) — always enabled; also populates portal_redirect_url
   dhcp_set_captiveportal_url();
-#endif
 
   // Start the http server
   start_web_server(_handler);
@@ -200,6 +251,7 @@ void stop_web_server(void) {
 
 void stop_captive_portal(void) {
     ESP_LOGI(TAG, "Stopping captive portal");
+    captive_mode = false;
 
     // Stop DNS server
     stop_dns_server(dns_handle);

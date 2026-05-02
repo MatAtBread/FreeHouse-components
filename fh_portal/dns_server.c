@@ -24,7 +24,7 @@
 #define OPCODE_MASK (0x7800)
 #define QR_FLAG (1 << 7)
 #define QD_TYPE_A (0x0001)
-#define ANS_TTL_SEC (300)
+#define ANS_TTL_SEC (1)
 
 extern const char *TAG;
 // DNS Header Packet
@@ -115,10 +115,9 @@ static int parse_dns_request(char *req, size_t req_len, char *dns_reply, size_t 
   header->flags |= QR_FLAG;
 
   uint16_t qd_count = ntohs(header->qd_count);
-  header->an_count = htons(qd_count);
 
-  int reply_len = qd_count * sizeof(dns_answer_t) + req_len;
-  if (reply_len > dns_reply_max_len) {
+  // Worst-case buffer check before looping
+  if ((int)(qd_count * sizeof(dns_answer_t) + req_len) > dns_reply_max_len) {
     return -1;
   }
 
@@ -126,6 +125,7 @@ static int parse_dns_request(char *req, size_t req_len, char *dns_reply, size_t 
   char *cur_ans_ptr = dns_reply + req_len;
   char *cur_qd_ptr = dns_reply + sizeof(dns_header_t);
   char name[128];
+  uint16_t an_count = 0;
 
   // Respond to all questions based on configured rules
   for (int qd_i = 0; qd_i < qd_count; qd_i++) {
@@ -141,11 +141,11 @@ static int parse_dns_request(char *req, size_t req_len, char *dns_reply, size_t 
 
     ESP_LOGD(TAG, "Received type: %d | Class: %d | Question for: %s", qd_type, qd_class, name);
 
+    // Only answer A queries — non-A types (e.g. AAAA) get no answer record,
+    // which is a valid empty response and avoids a malformed packet.
     if (qd_type == QD_TYPE_A) {
       esp_ip4_addr_t ip = {.addr = IPADDR_ANY};
-      // Check the configured rules to decide whether to answer this question or not
       for (int i = 0; i < h->num_of_entries; ++i) {
-        // check if the name either corresponds to the entry, or if we should answer to all queries ("*")
         if (strcmp(h->entry[i].name, "*") == 0 || strcmp(h->entry[i].name, name) == 0) {
           if (h->entry[i].if_key) {
             esp_netif_ip_info_t ip_info;
@@ -158,23 +158,27 @@ static int parse_dns_request(char *req, size_t req_len, char *dns_reply, size_t 
           }
         }
       }
-      if (ip.addr == IPADDR_ANY) {  // no rule applies, continue with another question
+      if (ip.addr == IPADDR_ANY) {
         continue;
       }
       dns_answer_t *answer = (dns_answer_t *)cur_ans_ptr;
-
       answer->ptr_offset = htons(0xC000 | (cur_qd_ptr - dns_reply));
       answer->type = htons(qd_type);
       answer->class = htons(qd_class);
       answer->ttl = htonl(ANS_TTL_SEC);
+      answer->addr_len = htons(sizeof(ip.addr));
+      answer->ip_addr = ip.addr;
 
       ESP_LOGD(TAG, "Answer with PTR offset: 0x%" PRIX16 " and IP 0x%" PRIX32, ntohs(answer->ptr_offset), ip.addr);
 
-      answer->addr_len = htons(sizeof(ip.addr));
-      answer->ip_addr = ip.addr;
+      cur_ans_ptr += sizeof(dns_answer_t);
+      an_count++;
     }
   }
-  return reply_len;
+
+  // Set answer count to only the records we actually appended
+  header->an_count = htons(an_count);
+  return req_len + an_count * sizeof(dns_answer_t);
 }
 
 /*
