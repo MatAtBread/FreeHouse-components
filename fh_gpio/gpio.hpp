@@ -17,6 +17,7 @@ class GPIO {
         static bool digitalRead(int pin);
         static int analogRead(int pin, adc_atten_t atten = ADC_ATTEN_DB_12, bool calibrated = false);
         static int analogReadMilliVolts(int pin);
+        static void sleepState(int pin, bool value);
 };
 
 #endif // IO_H

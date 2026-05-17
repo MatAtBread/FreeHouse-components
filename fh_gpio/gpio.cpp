@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_sleep.h"
 #include "hal/gpio_types.h"
 #include <freertos/FreeRTOS.h>
 
@@ -15,18 +16,46 @@ static PinMode lastMode[GPIO_NUM_MAX] = {(PinMode)0};
 static bool lastWrite[GPIO_NUM_MAX];
 
 void GPIO::pinMode(int pin, PinMode mode) {
-  /*if (lastMode[pin] != mode)*/ {
+  gpio_hold_dis((gpio_num_t)pin);
+  gpio_reset_pin((gpio_num_t)pin);
+  gpio_config_t cfg = {
+    .pin_bit_mask = 1ULL << pin,
+    .mode = mode == INPUT ? GPIO_MODE_INPUT : GPIO_MODE_OUTPUT, // Also, OD variants
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE
+  };
+  gpio_config(&cfg);
+  lastMode[pin] = mode;
+}
+
+void GPIO::sleepState(int pin, bool value) {
+  // 1. Fully reset and clear active runtime driver assignments for target pins
     gpio_reset_pin((gpio_num_t)pin);
-    gpio_config_t cfg = {
-      .pin_bit_mask = 1ULL << pin,
-      .mode = mode == INPUT ? GPIO_MODE_INPUT : GPIO_MODE_OUTPUT, // Also, OD variants
-      .pull_up_en = GPIO_PULLUP_DISABLE,
-      .pull_down_en = GPIO_PULLDOWN_DISABLE,
-      .intr_type = GPIO_INTR_DISABLE
+
+    // 2. Build the unified bitmask for the digital outputs needing lockdown
+    uint64_t pin_mask = (1ULL << pin);
+    // 3. Configure the sleep structures for the High-Performance domain override
+    gpio_config_t sleep_io_conf = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE
     };
-    gpio_config(&cfg);
-    lastMode[pin] = mode;
-  }
+    gpio_config(&sleep_io_conf);
+
+    // 4. Drive individual pins to their optimized low-power states
+    gpio_set_level((gpio_num_t)pin, value); // Force Phase LOW to prevent H-Bridge gate float
+
+    // 5. Force the IO MUX sleep engine to isolate pins from background peripherals
+    // Crucial for NSLEEP (19) and CHARGING (20) to detach them from the native USB PHY
+    gpio_sleep_sel_en((gpio_num_t)pin);
+
+    // 6. Lock these exact states directly into the hardware digital retention latches
+    gpio_hold_en((gpio_num_t)pin);
+
+    // 7. Keep the VDD_SDIO retention memory rail powered to maintain the latches
+    esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_ON);
 }
 
 void GPIO::digitalWrite(int pin, bool value) {
