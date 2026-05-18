@@ -124,6 +124,10 @@ static httpd_handle_t server = NULL;
 static dns_server_handle_t dns_handle = NULL;
 static bool captive_mode = false;
 
+bool is_captive_portal_active(void) {
+    return captive_mode;
+}
+
 static esp_err_t getHandler(httpd_req_t *req) {
     char host[64] = "";
     httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));

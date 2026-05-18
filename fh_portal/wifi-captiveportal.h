@@ -14,5 +14,6 @@ void stop_web_server(void);
 void stop_captive_portal(void);
 
 const char* get_portal_redirect_url(void);
+bool is_captive_portal_active(void);
 
 #endif
