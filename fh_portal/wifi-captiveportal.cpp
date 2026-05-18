@@ -24,6 +24,7 @@ extern "C" esp_err_t dev_wifi_init(wifi_init_config_t *config);
 #include "esp_http_server.h"
 #include "dns_server.h"
 #include "ota.h"
+#include "wifi_scan.h"
 
 #include "wifi-captiveportal.h"
 
@@ -198,6 +199,13 @@ void start_web_server(HttpGetHandler *_handler) {
       .user_ctx  = NULL
     };
     httpd_register_uri_handler(server, &ota_uri);
+    static const httpd_uri_t scan_uri = {
+      .uri       = "/scan",
+      .method    = HTTP_GET,
+      .handler   = wifi_scan_http_handler,
+      .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(server, &scan_uri);
     static const httpd_uri_t anyGet = {
       .uri = "*",
       .method = HTTP_GET,

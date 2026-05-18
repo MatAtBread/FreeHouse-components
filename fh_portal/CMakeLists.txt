@@ -3,6 +3,7 @@ idf_component_register(
         "dns_server.c"
         "ota.c"
         "wifi-captiveportal.cpp"
+        "wifi_scan.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
